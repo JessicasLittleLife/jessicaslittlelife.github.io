@@ -1,0 +1,1033 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Jessica Lech · hi, i'm jessica</title>
+<meta name="description" content="Jessica Lech: St. Augustine host, maker, and forever party planner. Cakes, catering, charcuterie, and handmade things, available for hire.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600;700&amp;family=Quicksand:wght@400;500;600;700&amp;family=Permanent+Marker&amp;display=swap" rel="stylesheet">
+<style>
+  :root{
+    --cream:#FFF8EC;
+    --white:#FFFFFF;
+    --pink:#FF4FA0;
+    --pink-soft:#FFD9EC;
+    --yellow:#FFD23D;
+    --yellow-soft:#FFF3C2;
+    --sky:#33C2F0;
+    --sky-soft:#D2F1FC;
+    --grape:#8A5CF6;
+    --grape-soft:#E7DEFF;
+    --ink:#241942;
+    --ink-soft:#5C5179;
+    --line: rgba(36,25,66,0.14);
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    margin:0;
+    background:var(--cream);
+    color:var(--ink);
+    font-family:'Quicksand',sans-serif;
+    font-size:16px;
+    line-height:1.6;
+    font-weight:500;
+    -webkit-font-smoothing:antialiased;
+    overflow-x:hidden;
+  }
+  h1,h2,h3,h4{
+    font-family:'Fredoka',sans-serif;
+    font-weight:600;
+    margin:0;
+    line-height:1.06;
+  }
+  a{color:inherit;text-decoration:none;}
+  img{max-width:100%;display:block;}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 24px;position:relative;}
+  .eyebrow{
+    font-family:'Permanent Marker',cursive;
+    font-size:15px;
+    color:var(--pink);
+    display:inline-block;
+    transform:rotate(-2deg);
+    margin-bottom:6px;
+  }
+  section{padding:64px 0;position:relative;}
+  @media (max-width:720px){ section{padding:44px 0;} .deco-pose{display:none;} }
+  .mark{text-decoration:underline;text-decoration-style:wavy;text-decoration-thickness:5px;text-underline-offset:5px;}
+  .mark.pink{text-decoration-color:var(--pink);}
+  .mark.yellow{text-decoration-color:var(--yellow);}
+  .mark.sky{text-decoration-color:var(--sky);}
+  .mark.grape{text-decoration-color:var(--grape);}
+
+  /* ---------- Wave dividers ---------- */
+  .wave{display:block;width:100%;height:46px;margin-top:-1px;}
+  @media (max-width:720px){ .wave{height:28px;} }
+
+  /* ---------- Nav ---------- */
+  header.site-nav{
+    position:sticky; top:0; z-index:100;
+    background:var(--cream);
+    border-bottom:3px solid var(--ink);
+  }
+  .nav-inner{
+    max-width:1080px;margin:0 auto;padding:14px 24px;
+    display:flex;align-items:center;justify-content:space-between;
+  }
+  .wordmark{
+    font-family:'Fredoka',sans-serif;font-weight:700;font-size:21px;color:var(--ink);
+  }
+  .wordmark span{color:var(--pink);}
+  nav.links{display:flex;align-items:center;gap:26px;}
+  nav.links a{font-size:14px;font-weight:600;color:var(--ink-soft);}
+  nav.links a:hover{color:var(--pink);}
+  .nav-toggle{display:none;background:none;border:none;font-size:26px;cursor:pointer;color:var(--ink);}
+  @media (max-width:860px){
+    nav.links{
+      position:absolute;top:100%;left:0;right:0;background:var(--cream);
+      flex-direction:column;align-items:flex-start;gap:0;border-bottom:3px solid var(--ink);
+      max-height:0;overflow:hidden;transition:max-height .3s ease;
+    }
+    nav.links.open{max-height:420px;}
+    nav.links a{padding:14px 24px;border-top:1px solid var(--line);width:100%;}
+    .nav-toggle{display:block;}
+  }
+
+  /* ---------- Buttons ---------- */
+  .btn{
+    display:inline-block;font-family:'Fredoka',sans-serif;font-weight:600;font-size:15px;
+    padding:13px 26px;border-radius:999px;border:3px solid var(--ink);
+    box-shadow:4px 4px 0 var(--ink);
+    transition:transform .12s ease, box-shadow .12s ease;
+    cursor:pointer;
+  }
+  .btn:hover{transform:translate(2px,2px);box-shadow:2px 2px 0 var(--ink);}
+  .btn-pink{background:var(--pink);color:var(--white);}
+  .btn-outline{background:var(--white);color:var(--ink);}
+  .btn-yellow{background:var(--yellow);color:var(--ink);}
+  .btn-row{display:flex;gap:14px;flex-wrap:wrap;}
+
+  /* ---------- Stickers (doodles) ---------- */
+  .sticker{position:absolute;pointer-events:none;}
+
+  /* ---------- Photo frames ---------- */
+  .frame{
+    aspect-ratio:4/5;border-radius:14px;display:flex;align-items:center;justify-content:center;
+    text-align:center;padding:14px;font-family:'Quicksand',sans-serif;font-weight:700;font-size:12.5px;
+    letter-spacing:.02em;color:rgba(36,25,66,0.45);cursor:default;
+  }
+  .frame.g-pink{background:linear-gradient(160deg,var(--pink-soft),#FFE2F1);}
+  .frame.g-yellow{background:linear-gradient(160deg,var(--yellow-soft),#FFF7DD);}
+  .frame.g-sky{background:linear-gradient(160deg,var(--sky-soft),#E5F8FD);}
+  .frame.g-grape{background:linear-gradient(160deg,var(--grape-soft),#F1ECFF);}
+  .frame.photo-set{color:transparent;font-size:0;}
+  .frame.photo-fill{padding:0;overflow:hidden;background:var(--white);}
+  .frame.photo-fill img{width:100%;height:100%;object-fit:cover;max-width:none;max-height:none;}
+  .photo-lg{
+    max-width:300px;margin:0 auto 32px;border:3px solid var(--ink);border-radius:20px;
+    box-shadow:6px 10px 0 rgba(36,25,66,0.15);
+  }
+
+  /* ---------- Hero ---------- */
+  .hero{background:var(--cream);padding:54px 0 70px;overflow:visible;}
+  .hero-grid{display:grid;grid-template-columns:1.1fr 0.9fr;gap:50px;align-items:center;}
+  .hero-copy h1{font-size:clamp(42px,6.4vw,68px);}
+  .hero-copy .script-sub{
+    font-family:'Permanent Marker',cursive;font-size:18px;color:var(--grape);
+    display:block;margin-top:10px;transform:rotate(-1deg);
+  }
+  .hero-copy p.lede{font-size:18px;color:var(--ink-soft);max-width:470px;margin:18px 0 26px;}
+  .hero-portrait{max-width:330px;margin:0 auto;position:relative;}
+  @media (max-width:860px){
+    .hero-grid{grid-template-columns:1fr;gap:38px;text-align:center;}
+    .hero-copy p.lede{margin:18px auto 26px;}
+    .btn-row{justify-content:center;}
+    .hero-portrait img{position:static !important;width:100px !important;margin:16px auto 0;transform:none !important;}
+  }
+
+  /* ---------- About ---------- */
+  .about{background:var(--pink-soft);}
+  .about-grid{display:grid;grid-template-columns:0.85fr 1.15fr;gap:48px;align-items:center;}
+  .about-portrait{max-width:300px;margin:0 auto;position:relative;}
+  .about h2{font-size:clamp(28px,3.6vw,40px);}
+  .about p.body-copy{font-size:16.5px;color:var(--ink);margin-top:16px;max-width:560px;}
+  @media (max-width:860px){.about-grid{grid-template-columns:1fr;}}
+
+  .mini-favs{margin-top:38px;padding-top:30px;border-top:2px dashed var(--line);}
+  .chip-row{display:flex;flex-wrap:wrap;gap:9px;margin-top:12px;}
+  .chip-sm{
+    background:var(--white);border:2.5px solid var(--ink);border-radius:999px;
+    padding:8px 14px;font-weight:600;font-size:13.5px;box-shadow:2px 3px 0 var(--ink);
+  }
+  .chip-sm:nth-child(4n+1){background:var(--yellow-soft);}
+  .chip-sm:nth-child(4n+2){background:var(--sky-soft);}
+  .chip-sm:nth-child(4n+3){background:var(--pink-soft);}
+  .chip-sm:nth-child(4n+4){background:var(--grape-soft);}
+
+  /* ---------- Facts ---------- */
+  .facts{background:var(--sky-soft);padding:36px 0;}
+  .facts h2{font-size:clamp(22px,2.8vw,30px);text-align:center;}
+  .facts-sub{text-align:center;color:var(--ink-soft);max-width:400px;margin:6px auto 20px;font-size:14px;}
+  .fact-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;}
+  .fact-card{
+    background:var(--white);border-radius:10px;padding:12px 10px;
+    border:2.5px solid var(--ink);box-shadow:3px 3px 0 var(--ink);
+  }
+  .fact-card .script{font-family:'Permanent Marker',cursive;color:var(--pink);font-size:11px;display:block;}
+  .fact-answer{font-weight:700;margin-top:4px;font-size:13px;line-height:1.3;}
+  @media (max-width:860px){.fact-grid{grid-template-columns:1fr 1fr;}}
+  @media (max-width:520px){.fact-grid{grid-template-columns:1fr;}}
+
+  /* ---------- Hire Me ---------- */
+  .hire{background:var(--grape-soft);}
+  .hire h2{font-size:clamp(28px,3.6vw,40px);text-align:center;}
+  .hire-sub{text-align:center;color:var(--ink-soft);max-width:480px;margin:10px auto 8px;font-size:16.5px;}
+  .hire-note{text-align:center;color:var(--ink-soft);font-size:14.5px;margin:18px auto 24px;max-width:420px;}
+  .service-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:28px;}
+  .service-card{
+    background:var(--white);border:3px solid var(--ink);border-radius:16px;
+    padding:18px 14px;text-align:center;font-weight:700;font-size:14.5px;
+    box-shadow:3px 4px 0 var(--ink);
+  }
+  .service-card:nth-child(odd){transform:rotate(-1.2deg);}
+  .service-card:nth-child(even){transform:rotate(1.2deg);}
+  @media (max-width:860px){.service-grid{grid-template-columns:1fr 1fr;}}
+  @media (max-width:520px){.service-grid{grid-template-columns:1fr;}}
+  .hire-cta{text-align:center;margin-top:32px;}
+
+  /* ---------- Work ---------- */
+  .work{background:var(--cream);}
+  .work h2{font-size:clamp(28px,3.6vw,40px);text-align:center;}
+  .work-sub{text-align:center;color:var(--ink-soft);max-width:520px;margin:10px auto 6px;font-size:16px;}
+  .work-link{display:block;text-align:center;font-weight:700;color:var(--pink);margin-bottom:30px;font-size:15px;}
+
+  .made-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:10px;}
+  .made-card{
+    background:var(--white);border:3px solid var(--ink);border-radius:16px;overflow:hidden;
+    box-shadow:4px 5px 0 var(--ink);
+  }
+  .made-card img{width:100%;aspect-ratio:4/5;object-fit:cover;display:block;}
+  .made-card .made-title{padding:9px 10px;font-family:'Fredoka',sans-serif;font-weight:600;font-size:13px;text-align:center;line-height:1.25;}
+  @media (max-width:860px){.made-grid{grid-template-columns:repeat(2,1fr);gap:12px;}}
+  @media (max-width:520px){.made-grid{grid-template-columns:repeat(2,1fr);gap:10px;} .made-card .made-title{font-size:12px;padding:8px 8px;}}
+
+  .tags{margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;}
+  .tag{font-size:11.5px;font-weight:700;padding:5px 11px;border-radius:999px;border:2px solid var(--ink);}
+  .tag:nth-child(1){background:var(--yellow);}
+  .tag:nth-child(2){background:var(--sky-soft);}
+
+  /* ---------- Gallery ---------- */
+  .gallery{background:var(--grape-soft);}
+  .gallery h2{font-size:clamp(28px,3.6vw,38px);text-align:center;}
+  .gallery-sub{text-align:center;color:var(--ink-soft);max-width:480px;margin:10px auto 0;font-size:16px;}
+  .gallery-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:30px;}
+  .gallery-grid .g-photo{
+    aspect-ratio:1/1;border-radius:14px;overflow:hidden;border:3px solid var(--ink);
+    box-shadow:3px 4px 0 var(--ink);
+  }
+  .gallery-grid .g-photo img{width:100%;height:100%;object-fit:cover;display:block;}
+  @media (max-width:860px){.gallery-grid{grid-template-columns:repeat(3,1fr);gap:10px;}}
+  @media (max-width:520px){.gallery-grid{grid-template-columns:repeat(2,1fr);gap:8px;}}
+
+  /* ---------- Coming soon ---------- */
+  .upcoming{background:var(--yellow-soft);}
+  .upcoming h2{font-size:clamp(28px,3.6vw,38px);text-align:center;}
+  .up-strip{margin-top:30px;display:flex;flex-direction:column;gap:14px;}
+  .up-row{
+    background:var(--white);border:3px solid var(--ink);border-radius:16px;
+    padding:18px 22px;display:flex;flex-wrap:wrap;gap:14px;align-items:baseline;
+    box-shadow:3px 4px 0 var(--ink);
+  }
+  .up-row .script{font-family:'Permanent Marker',cursive;color:var(--grape);font-size:14px;min-width:170px;}
+  .up-row p{margin:0;font-weight:600;}
+
+  /* ---------- Socials ---------- */
+  .socials{background:var(--pink-soft);}
+  .socials h2{font-size:clamp(28px,3.6vw,38px);text-align:center;}
+  .soc-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:28px;max-width:560px;margin-left:auto;margin-right:auto;}
+  .soc-card{
+    background:var(--white);border:3px solid var(--ink);border-radius:16px;padding:22px;text-align:center;
+    box-shadow:4px 5px 0 var(--ink);transition:transform .12s ease;
+  }
+  .soc-card:hover{transform:translateY(-3px);}
+  .soc-card h4{font-size:17px;}
+  .soc-card p{margin:4px 0 0;color:var(--ink-soft);font-weight:700;}
+  .email-line{text-align:center;margin-top:22px;font-weight:600;}
+  .email-line a{color:var(--pink);font-weight:700;}
+
+  /* ---------- Footer ---------- */
+  footer{
+    background:var(--ink);color:var(--cream);text-align:center;padding:60px 24px 40px;position:relative;
+  }
+  .seal{
+    width:66px;height:66px;border-radius:50%;border:3px solid var(--yellow);
+    display:flex;align-items:center;justify-content:center;margin:0 auto 16px;
+    font-family:'Fredoka',sans-serif;font-weight:700;font-size:26px;color:var(--yellow);
+  }
+  footer .script{font-family:'Permanent Marker',cursive;font-size:20px;color:var(--pink);}
+  footer p{margin:8px 0 0;font-size:13.5px;color:#C9C0E0;}
+
+  /* ---------- Reveal ---------- */
+  .reveal{opacity:0;transform:translateY(16px);transition:opacity .5s ease, transform .5s ease;}
+  .reveal.in{opacity:1;transform:translateY(0);}
+
+  /* ---------- Edit mode ---------- */
+  #editToggle{
+    position:fixed;bottom:20px;right:20px;z-index:200;
+    background:var(--ink);color:var(--cream);border:3px solid var(--ink);
+    font-family:'Fredoka',sans-serif;font-weight:600;border-radius:999px;
+    padding:12px 20px;box-shadow:4px 4px 0 rgba(36,25,66,0.4);cursor:pointer;font-size:14px;
+  }
+  #editTools{
+    position:fixed;bottom:20px;right:20px;left:20px;z-index:200;
+    background:var(--white);border:3px solid var(--ink);border-radius:18px;
+    padding:14px 18px;box-shadow:4px 4px 0 rgba(36,25,66,0.3);
+    display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:center;
+  }
+  #editTools button{
+    font-family:'Fredoka',sans-serif;font-weight:600;border-radius:999px;border:2.5px solid var(--ink);
+    padding:9px 16px;cursor:pointer;font-size:13.5px;
+  }
+  #editSave{background:var(--pink);color:#fff;}
+  #editDone{background:var(--yellow);}
+  #editReset{background:var(--white);}
+  .edit-mode [data-edit]{outline:2px dashed var(--sky);border-radius:4px;}
+  .edit-mode [data-photo]{cursor:pointer;outline:2px dashed var(--pink);}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<header class="site-nav">
+  <div class="nav-inner">
+    <a class="wordmark" href="#top">jessica <span>lech</span></a>
+    <nav class="links" id="navLinks">
+      <a href="#about">about</a>
+      <a href="#hire">hire me</a>
+      <a href="#portfolio">work</a>
+      <a class="btn btn-pink" style="padding:8px 18px;font-size:13px;" href="mailto:jessicalech00@gmail.com?subject=Hi%20Jessica!">say hi</a>
+    </nav>
+    <button class="nav-toggle" id="navToggle" aria-label="menu">☰</button>
+  </div>
+</header>
+
+<!-- HERO -->
+<section class="hero" id="top">
+  <div class="wrap hero-grid">
+    <div class="hero-copy reveal in">
+      <p class="eyebrow" data-edit="e1">st. augustine, florida</p>
+      <h1 data-edit="e2">hi, i'm <span class="mark pink">jessica</span>.</h1>
+      <span class="script-sub" data-edit="e3">nice to meet you!</span>
+      <p class="lede" data-edit="e4">Cat mom, thrift-store regular, and the friend who shows up with a charcuterie board with no notice needed. Hostess at heart, planner by nature, sucker for a good dessert table. Welcome to my little corner of life.</p>
+      <div class="btn-row">
+        <a class="btn btn-outline" href="#about">see what i'm up to</a>
+        <a class="btn btn-pink" href="mailto:jessicalech00@gmail.com?subject=Hi%20Jessica!">say hi</a>
+      </div>
+    </div>
+    <div class="hero-portrait reveal in" style="position:relative;">
+      <div class="frame g-pink" data-photo="hero" style="border-radius:18px;border:3px solid var(--ink);box-shadow:5px 8px 0 rgba(36,25,66,0.15);aspect-ratio:4/5;"><img src="assets/pose-standing.png" alt="" style="max-width:78%;max-height:84%;object-fit:contain;"></div>
+    </div>
+  </div>
+</section>
+<svg class="wave" viewBox="0 0 1200 40" preserveAspectRatio="none"><path d="M0 20 C150 0 300 40 450 20 C600 0 750 40 900 20 C1050 0 1150 30 1200 20 V40 H0 Z" fill="#FFD9EC"></path></svg>
+
+<!-- ABOUT -->
+<section class="about" id="about">
+  <div class="wrap about-grid">
+    <div class="about-portrait reveal in">
+      <div class="frame g-yellow photo-fill" data-photo="about" style="border-radius:18px;border:3px solid var(--ink);box-shadow:5px 8px 0 rgba(36,25,66,0.15);aspect-ratio:4/5;"><img src="assets/about-jessica.jpg" alt="Jessica Lech"></div>
+    </div>
+    <div class="reveal in" style="position:relative;">
+      <p class="eyebrow" data-edit="e5">a little about me</p>
+      <h2 data-edit="e6">calm, collected, and a little bit <span class="mark grape">extra</span></h2>
+      <p class="body-copy" data-edit="e7">I care about doing things properly. Quality over quantity, always put together, never an afterthought. Whether I'm hosting twelve people with zero notice, helping a friend find the right words for a hard conversation, or making sure ten closings run without a single hiccup, I show up the same way: composed, generous, and ready to make it happen.</p>
+      <p class="body-copy" data-edit="e8">By day, I'm the Operations Manager at Beach State Realty, keeping a team of 10+ Realtors running smoothly. Transaction coordination, marketing, social media, and all the behind-the-scenes details that make real estate feel effortless. I'm a licensed Realtor myself, too. I closed over $1,000,000 in my first year, so I know exactly how a transaction works from start to finish, and I'm good at explaining it in plain English.</p>
+    </div>
+  </div>
+  <div class="wrap mini-favs">
+    <p class="eyebrow" data-edit="e9" style="display:block;">a few favorite things</p>
+    <div class="chip-row">
+      <span class="chip-sm reveal in" data-edit="e12">My cats</span>
+      <span class="chip-sm reveal in" data-edit="e13">Jason, my husband (super hot)</span>
+      <span class="chip-sm reveal in" data-edit="e14">Weekend beach &amp; thrift trips</span>
+      <span class="chip-sm reveal in" data-edit="e15">Food! Food. Also wine.</span>
+      <span class="chip-sm reveal in" data-edit="e16">Taking photos</span>
+      <span class="chip-sm reveal in" data-edit="e17">People watching</span>
+      <span class="chip-sm reveal in" data-edit="e18">Cooking &amp; baking</span>
+      <span class="chip-sm reveal in" data-edit="e19">Beauty &amp; fashion</span>
+      <span class="chip-sm reveal in" data-edit="e20">Crafting</span>
+      <span class="chip-sm reveal in" data-edit="e21">A quality charcuterie board</span>
+      <span class="chip-sm reveal in" data-edit="e22">Dessert (chocolate, always)</span>
+      <span class="chip-sm reveal in" data-edit="e23">Finding someone their perfect home</span>
+    </div>
+  </div>
+</section>
+<svg class="wave" viewBox="0 0 1200 40" preserveAspectRatio="none"><path d="M0 20 C150 0 300 40 450 20 C600 0 750 40 900 20 C1050 0 1150 30 1200 20 V40 H0 Z" fill="#D2F1FC"></path></svg>
+
+<!-- FACTS -->
+<section class="facts" id="facts">
+  <div class="wrap" style="position:relative;">
+    <img class="deco-pose" src="assets/pose-sitting.png" alt="" style="position:absolute;width:130px;top:-26px;left:0;transform:rotate(-4deg);filter:drop-shadow(3px 6px 0 rgba(36,25,66,0.16));">
+    <p class="eyebrow" data-edit="e24" style="display:block;text-align:center;">let's get personal</p>
+    <h2 data-edit="e25">a few random facts about me</h2>
+    <p class="facts-sub" data-edit="e26">The stuff that doesn't fit anywhere else but somehow says the most.</p>
+    <div class="fact-grid">
+      <div class="fact-card reveal in"><span class="script" data-edit="e27">birthday</span><p class="fact-answer" data-edit="e28">june 23</p></div>
+      <div class="fact-card reveal in"><span class="script" data-edit="e29">can't leave the house without</span><p class="fact-answer" data-edit="e30">lipgloss &amp; saying bye to my cats</p></div>
+      <div class="fact-card reveal in"><span class="script" data-edit="e31">coffee order</span><p class="fact-answer" data-edit="e32">vanilla latte, extra sweet</p></div>
+      <div class="fact-card reveal in"><span class="script" data-edit="e33">night out go-to drink</span><p class="fact-answer" data-edit="e34">white wine or a chocotini</p></div>
+      <div class="fact-card reveal in"><span class="script" data-edit="e35">i am currently</span><p class="fact-answer" data-edit="e36">26 years old</p></div>
+      <div class="fact-card reveal in"><span class="script" data-edit="e37">born and raised</span><p class="fact-answer" data-edit="e38">Long Island, NY</p></div>
+      <div class="fact-card reveal in"><span class="script" data-edit="e39">my degree is in</span><p class="fact-answer" data-edit="e40">culinary arts</p></div>
+      <div class="fact-card reveal in"><span class="script" data-edit="e41">my husband is</span><p class="fact-answer" data-edit="e42">Jason, chef &amp; bodybuilder</p></div>
+    </div>
+  </div>
+</section>
+<svg class="wave" viewBox="0 0 1200 40" preserveAspectRatio="none"><path d="M0 20 C150 40 300 0 450 20 C600 40 750 0 900 20 C1050 40 1150 10 1200 20 V40 H0 Z" fill="#E7DEFF"></path></svg>
+
+<!-- HIRE ME -->
+<section class="hire" id="hire">
+  <div class="wrap" style="position:relative;">
+    <p class="eyebrow" data-edit="e43" style="display:block;text-align:center;">available for hire</p>
+    <h2 data-edit="e44">need a hand making something special?</h2>
+    <p class="hire-sub" data-edit="e45">Hosting is my love language. If you need someone to handle the details for your next gathering, here's what I love making for other people too.</p>
+    <div class="frame g-pink photo-lg photo-fill" data-photo="hire-large"><img src="assets/hire-large.jpg" alt="Jessica hosting an event"></div>
+    <div class="service-grid">
+      <div class="service-card reveal in">Private dinner catering</div>
+      <div class="service-card reveal in">Group brunch catering</div>
+      <div class="service-card reveal in">Custom cakes</div>
+      <div class="service-card reveal in">Charcuterie boards</div>
+      <div class="service-card reveal in">Banner painting</div>
+      <div class="service-card reveal in">Baby showers</div>
+      <div class="service-card reveal in">Birthday parties</div>
+      <div class="service-card reveal in">Handmade gifts</div>
+    </div>
+    <p class="hire-note" data-edit="e46">No pricing here. Just tell me what you're dreaming up and we'll figure it out together.</p>
+    <div class="hire-cta">
+      <a class="btn btn-yellow" href="mailto:jessicalech00@gmail.com?subject=Let's%20make%20something!&amp;body=Hi%20Jessica%2C%20I%27d%20love%20to%20chat%20about...">say hi, let's talk →</a>
+    </div>
+  </div>
+</section>
+<svg class="wave" viewBox="0 0 1200 40" preserveAspectRatio="none"><path d="M0 20 C150 0 300 40 450 20 C600 0 750 40 900 20 C1050 0 1150 30 1200 20 V40 H0 Z" fill="#FFF8EC"></path></svg>
+
+<!-- WORK -->
+<section class="work" id="portfolio">
+  <div class="wrap">
+    <p class="eyebrow" data-edit="e47" style="display:block;text-align:center;">my work</p>
+    <h2 data-edit="e48">things i've made</h2>
+    <p class="work-sub" data-edit="e49">Events, cakes, catering, crafts, and the photos I take along the way, all for the people I love.</p>
+    <a class="work-link" href="#hire">want something like this for your event? hire me ↑</a>
+    <div class="made-grid">
+      <div class="made-card reveal in"><img src="assets/made-baked-alaska.jpg" alt="Baked Alaska"><p class="made-title">Baked Alaska</p></div>
+      <div class="made-card reveal in"><img src="assets/made-banner.jpeg" alt="Hand-painted party banner"><p class="made-title">Hand-Painted Banner</p></div>
+      <div class="made-card reveal in"><img src="assets/made-bear-table.jpg" alt="Bear-themed dessert table"><p class="made-title">Bear-Themed Dessert Table</p></div>
+      <div class="made-card reveal in"><img src="assets/made-brunch.jpeg" alt="Brunch spread"><p class="made-title">Brunch, Done Right</p></div>
+      <div class="made-card reveal in"><img src="assets/made-cake-26.jpg" alt="26th birthday cake"><p class="made-title">26th Birthday Cake</p></div>
+      <div class="made-card reveal in"><img src="assets/made-charcuterie-round.jpg" alt="Round charcuterie board"><p class="made-title">Round Charcuterie Board</p></div>
+      <div class="made-card reveal in"><img src="assets/made-cookie-boxes.jpeg" alt="Custom cookie boxes"><p class="made-title">Custom Cookie Boxes</p></div>
+      <div class="made-card reveal in"><img src="assets/made-dog-banner.jpg" alt="Dog-themed banner"><p class="made-title">Dog-Themed Banner</p></div>
+      <div class="made-card reveal in"><img src="assets/made-fish-art.jpg" alt="Hand-painted fish art"><p class="made-title">Hand-Painted Fish Art</p></div>
+      <div class="made-card reveal in"><img src="assets/made-gator-cake-closeup.jpg" alt="Gator cake"><p class="made-title">Gator Cake, Up Close</p></div>
+      <div class="made-card reveal in"><img src="assets/made-spritz-cake.jpeg" alt="Spritz cake"><p class="made-title">Spritz Cake</p></div>
+      <div class="made-card reveal in"><img src="assets/made-strawberry-bears.jpg" alt="Chocolate strawberry bears"><p class="made-title">Chocolate Strawberry Bears</p></div>
+      <div class="made-card reveal in"><img src="assets/made-teddy-cupcakes.jpg" alt="Teddy bear cupcakes"><p class="made-title">Teddy Bear Cupcakes</p></div>
+      <div class="made-card reveal in"><img src="assets/made-thanksgiving.jpg" alt="Thanksgiving spread"><p class="made-title">Thanksgiving Spread</p></div>
+      <div class="made-card reveal in"><img src="assets/made-truffles.jpg" alt="Handmade truffles"><p class="made-title">Handmade Truffles</p></div>
+      <div class="made-card reveal in"><img src="assets/made-welcome-banner.jpg" alt="Welcome banner"><p class="made-title">Welcome Banner</p></div>
+    </div>
+  </div>
+</section>
+<svg class="wave" viewBox="0 0 1200 40" preserveAspectRatio="none"><path d="M0 20 C150 40 300 0 450 20 C600 40 750 0 900 20 C1050 40 1150 10 1200 20 V40 H0 Z" fill="#FFF3C2"></path></svg>
+
+<!-- COMING SOON -->
+<section class="upcoming">
+  <div class="wrap">
+    <p class="eyebrow" data-edit="e62" style="display:block;text-align:center;">what's next</p>
+    <h2 data-edit="e63">coming soon</h2>
+    <div class="frame g-grape photo-lg photo-fill" data-photo="upcoming-large"><img src="assets/life-coming-soon.jpg" alt="Currently creating"></div>
+    <div class="up-strip">
+      <div class="up-row reveal in">
+        <span class="script" data-edit="e64">currently creating</span>
+        <p data-edit="e65">A fall tablescape I can't stop thinking about.</p>
+      </div>
+      <div class="up-row reveal in">
+        <span class="script" data-edit="e66">currently planning</span>
+        <p data-edit="e67">A small gathering to welcome the season's first cool evening.</p>
+      </div>
+      <div class="up-row reveal in">
+        <span class="script" data-edit="e68">currently loving</span>
+        <p data-edit="e69">A thrifted find I haven't stopped thinking about.</p>
+      </div>
+    </div>
+  </div>
+</section>
+<svg class="wave" viewBox="0 0 1200 40" preserveAspectRatio="none"><path d="M0 20 C150 0 300 40 450 20 C600 0 750 40 900 20 C1050 0 1150 30 1200 20 V40 H0 Z" fill="#E7DEFF"></path></svg>
+
+<!-- GALLERY -->
+<section class="gallery" id="gallery">
+  <div class="wrap">
+    <p class="eyebrow" data-edit="eg1" style="display:block;text-align:center;">a little bit of everything</p>
+    <h2 data-edit="eg2">the gallery</h2>
+    <p class="gallery-sub" data-edit="eg3">Events I've helped throw, and just a little bit of real life in between.</p>
+    <div class="gallery-grid">
+      <div class="g-photo reveal in"><img src="assets/hire-event-spread.jpg" alt="Catered event spread"></div>
+      <div class="g-photo reveal in"><img src="assets/hire-event-turnout.jpg" alt="Event turnout"></div>
+      <div class="g-photo reveal in"><img src="assets/hire-baby-table.jpg" alt="Baby shower table"></div>
+      <div class="g-photo reveal in"><img src="assets/hire-face-painting.jpg" alt="Face painting at an event"></div>
+      <div class="g-photo reveal in"><img src="assets/hire-fountain-table.jpg" alt="Fountain dessert table"></div>
+      <div class="g-photo reveal in"><img src="assets/hire-fruit-cheese-rose.jpg" alt="Fruit and cheese rose display"></div>
+      <div class="g-photo reveal in"><img src="assets/work-fruit-display.jpg" alt="Fruit display"></div>
+      <div class="g-photo reveal in"><img src="assets/life-beach-lay.jpg" alt="Beach day"></div>
+      <div class="g-photo reveal in"><img src="assets/life-candid.jpg" alt="Candid moment"></div>
+      <div class="g-photo reveal in"><img src="assets/life-cats-laptop.jpeg" alt="Cats and laptop"></div>
+      <div class="g-photo reveal in"><img src="assets/life-couple.jpg" alt="Jessica and Jason"></div>
+      <div class="g-photo reveal in"><img src="assets/life-flower-bouquet.jpg" alt="Flower bouquet"></div>
+      <div class="g-photo reveal in"><img src="assets/life-pink-swing.jpeg" alt="On a swing"></div>
+      <div class="g-photo reveal in"><img src="assets/life-vacation.jpg" alt="Vacation"></div>
+      <div class="g-photo reveal in"><img src="assets/life-waffle-car.jpeg" alt="Waffle car"></div>
+    </div>
+  </div>
+</section>
+<svg class="wave" viewBox="0 0 1200 40" preserveAspectRatio="none"><path d="M0 20 C150 0 300 40 450 20 C600 0 750 40 900 20 C1050 0 1150 30 1200 20 V40 H0 Z" fill="#FFD9EC"></path></svg>
+
+<!-- SOCIALS -->
+<section class="socials" id="socials">
+  <div class="wrap">
+    <p class="eyebrow" data-edit="e70" style="display:block;text-align:center;">follow along</p>
+    <h2 data-edit="e71">where to find me</h2>
+    <div class="soc-grid">
+      <a class="soc-card reveal in" href="https://instagram.com/jessicalynnlech" target="_blank" rel="noopener">
+        <h4 data-edit="e72">Instagram</h4>
+        <p data-edit="e73">@jessicalynnlech</p>
+      </a>
+      <a class="soc-card reveal in" href="https://tiktok.com/@jessicalynnlech" target="_blank" rel="noopener">
+        <h4 data-edit="e74">TikTok</h4>
+        <p data-edit="e75">@jessicalynnlech</p>
+      </a>
+    </div>
+    <p class="email-line reveal in">or email me directly at <a href="mailto:jessicalech00@gmail.com">jessicalech00@gmail.com</a></p>
+    <div class="frame g-sky photo-lg" data-photo="socials-large" style="margin-top:28px;"><img src="assets/pose-sunglasses.png" alt="" style="max-width:78%;max-height:84%;object-fit:contain;"></div>
+  </div>
+</section>
+
+<footer>
+  <div class="seal">J</div>
+  <span class="script" data-edit="e76">with so much love, jessica</span>
+  <p>© <span id="year">2026</span> Jessica Lech. All rights reserved.</p>
+  <p data-edit="e77">Operations Manager &amp; REALTOR® at Beach State Realty</p>
+</footer>
+
+
+
+
+<script>
+  document.getElementById('year').textContent = new Date().getFullYear();
+
+  var toggle = document.getElementById('navToggle');
+  var links = document.getElementById('navLinks');
+  toggle.addEventListener('click', function(){ links.classList.toggle('open'); });
+  links.querySelectorAll('a').forEach(function(a){ a.addEventListener('click', function(){ links.classList.remove('open'); }); });
+
+  var reveals = document.querySelectorAll('.reveal');
+  var io = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){ if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target); } });
+  }, {threshold:0.12});
+  reveals.forEach(function(el){ io.observe(el); });
+</script>
+
+<!-- EDIT MODE: lets you swap in real photos and tweak any text right in the browser,
+     then download the finished file to upload to your host. No coding required. -->
+<script>
+(function(){
+  var STORAGE_KEY = 'jlSiteEdits_v2';
+  var body = document.body;
+  var editToggleBtn = document.getElementById('editToggle');
+  var editTools = document.getElementById('editTools');
+  var saveBtn = document.getElementById('editSave');
+  var resetBtn = document.getElementById('editReset');
+  var doneBtn = document.getElementById('editDone');
+
+  function loadEdits(){
+    try{
+      var raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : {text:{}, photos:{}};
+    }catch(e){ return {text:{}, photos:{}}; }
+  }
+  function saveEdits(edits){
+    try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(edits)); }catch(e){}
+  }
+  var edits = loadEdits();
+
+  function setPhoto(el, dataUrl, persist){
+    el.style.backgroundImage = 'url(' + dataUrl + ')';
+    el.style.backgroundSize = 'cover';
+    el.style.backgroundPosition = 'center';
+    el.textContent = '';
+    el.classList.add('photo-set');
+    if(persist){
+      var id = el.getAttribute('data-photo');
+      edits.photos = edits.photos || {};
+      edits.photos[id] = dataUrl;
+      saveEdits(edits);
+    }
+  }
+
+  function applyEdits(){
+    Object.keys(edits.text || {}).forEach(function(id){
+      var el = document.querySelector('[data-edit="' + id + '"]');
+      if(el) el.innerHTML = edits.text[id];
+    });
+    Object.keys(edits.photos || {}).forEach(function(id){
+      var el = document.querySelector('[data-photo="' + id + '"]');
+      if(el) setPhoto(el, edits.photos[id], false);
+    });
+  }
+  applyEdits();
+
+  var fileInput = document.createElement('input');
+  fileInput.type = 'file';
+  fileInput.accept = 'image/*';
+  fileInput.style.display = 'none';
+  document.body.appendChild(fileInput);
+  var activePhotoEl = null;
+
+  fileInput.addEventListener('change', function(){
+    var file = fileInput.files && fileInput.files[0];
+    if(!file || !activePhotoEl) return;
+    var reader = new FileReader();
+    reader.onload = function(e){ setPhoto(activePhotoEl, e.target.result, true); };
+    reader.readAsDataURL(file);
+    fileInput.value = '';
+  });
+
+  document.querySelectorAll('[data-photo]').forEach(function(el){
+    el.addEventListener('click', function(){
+      if(!body.classList.contains('edit-mode')) return;
+      activePhotoEl = el;
+      fileInput.click();
+    });
+  });
+
+  document.querySelectorAll('[data-edit]').forEach(function(el){
+    el.addEventListener('input', function(){
+      var id = el.getAttribute('data-edit');
+      edits.text = edits.text || {};
+      edits.text[id] = el.innerHTML;
+      saveEdits(edits);
+    });
+  });
+
+  document.addEventListener('click', function(e){
+    if(!body.classList.contains('edit-mode')) return;
+    var a = e.target.closest('a');
+    if(a && !a.closest('#editTools')){ e.preventDefault(); }
+  }, true);
+
+  function setEditMode(on){
+    body.classList.toggle('edit-mode', on);
+    document.querySelectorAll('[data-edit]').forEach(function(el){ el.contentEditable = on; });
+    editTools.hidden = !on;
+    editToggleBtn.hidden = on;
+  }
+
+  editToggleBtn.addEventListener('click', function(){ setEditMode(true); });
+  doneBtn.addEventListener('click', function(){ setEditMode(false); });
+
+  resetBtn.addEventListener('click', function(){
+    if(confirm('Reset all your edits and go back to the original page? This cannot be undone.')){
+      localStorage.removeItem(STORAGE_KEY);
+      location.reload();
+    }
+  });
+
+  saveBtn.addEventListener('click', function(){
+    setEditMode(false);
+    var clone = document.documentElement.cloneNode(true);
+    var tools = clone.querySelector('#editTools');
+    if(tools) tools.remove();
+    var tbtn = clone.querySelector('#editToggle');
+    if(tbtn) tbtn.remove();
+    var fi = clone.querySelector('input[type="file"]');
+    if(fi) fi.remove();
+    clone.querySelectorAll('[data-edit]').forEach(function(el){ el.removeAttribute('contenteditable'); });
+    clone.classList.remove('edit-mode');
+    var html = '<!DOCTYPE html>\n' + clone.outerHTML;
+    var blob = new Blob([html], {type:'text/html'});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'index.html';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+})();
+</script>
+
+<button id="editToggle">✎ edit this page</button>
+<div id="editTools" hidden>
+  <button id="editSave">save &amp; download</button>
+  <button id="editDone">done editing</button>
+  <button id="editReset">reset all edits</button>
+</div>
+
+</body></html>
